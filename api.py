@@ -1,13 +1,20 @@
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel#定义数据格式（JSON长什么样）
 
-from database import insert_document_record, list_document_records
+from database import (
+    delete_document_record,
+    get_document_record,
+    insert_document_record,
+    list_document_records,
+)
 from main import (
     answer_with_chroma_rag,
     ask_llm,
     create_initial_messages,
+    delete_chroma_collection,
     explain_error,
     save_chunks_to_chroma,
     split_text,
@@ -20,6 +27,18 @@ app = FastAPI(
     description="第二阶段学习用的 FastAPI 后端入口。",
     version="0.1.0",
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def raise_internal_error(error: Exception, context: str) -> None:
+    """记录服务端日志，并把错误转换成适合接口返回的 500。"""
+    logger.exception("%s failed: %s", context, error)
+    raise HTTPException(
+        status_code=500,
+        detail=explain_error(error),
+    ) from error
 
 
 class EchoRequest(BaseModel):#前端给我的JSON，FastAPI 会自动把 JSON 塞进 EchoRequest
@@ -96,6 +115,24 @@ class AskDocResponse(BaseModel):
     sources: list[SourceChunk]
 
 
+class DocumentQuestionRequest(BaseModel):
+    """POST /documents/{document_id}/questions 的请求体。"""
+
+    question: str
+    top_k: int = 3
+    min_score: float = 0.2
+
+
+class DeleteDocumentResponse(BaseModel):
+    """DELETE /documents/{document_id} 的响应体。"""
+
+    id: int
+    filename: str
+    collection_name: str
+    deleted_from_chroma: bool
+    deleted_from_mysql: bool
+
+
 class DocumentRecord(BaseModel):
     """GET /documents 返回的一条文档记录。"""
 
@@ -105,6 +142,34 @@ class DocumentRecord(BaseModel):
     chunk_count: int
     indexed_count: int
     created_at: str
+
+
+def build_document_record(record: dict) -> DocumentRecord:
+    """把 MySQL 查询结果转成接口响应对象。"""
+    return DocumentRecord(
+        id=int(record["id"]),
+        filename=str(record["filename"]),
+        collection_name=str(record["collection_name"]),
+        chunk_count=int(record["chunk_count"]),
+        indexed_count=int(record["indexed_count"]),
+        created_at=str(record["created_at"]),
+    )
+
+
+def get_existing_document_or_404(document_id: int) -> dict:
+    """根据 document_id 查询文档，不存在时返回 404。"""
+    try:
+        record = get_document_record(document_id)
+    except Exception as error:
+        raise_internal_error(error, f"get document {document_id}")
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"没有找到 id 为 {document_id} 的文档。",
+        )
+
+    return record
 
 
 @app.get("/health")
@@ -157,10 +222,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     try:
         answer = ask_llm(messages)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=explain_error(error),
-        ) from error
+        raise_internal_error(error, "POST /chat")
 
     return ChatResponse(answer=answer)
 
@@ -181,10 +243,7 @@ def summarize(request: SummarizeRequest) -> SummarizeResponse:
     try:
         summary = summarize_text(text)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=explain_error(error),
-        ) from error
+        raise_internal_error(error, "POST /summarize")
 
     return SummarizeResponse(summary=summary)
 
@@ -247,10 +306,7 @@ async def upload_document(
             detail=str(error),
         ) from error
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=explain_error(error),
-        ) from error
+        raise_internal_error(error, f"POST /documents filename={filename}")
 
     return DocumentUploadResponse(
         id=document_id,
@@ -267,22 +323,89 @@ def list_documents() -> list[DocumentRecord]:
     try:
         records = list_document_records()
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=explain_error(error),
-        ) from error
+        raise_internal_error(error, "GET /documents")
 
-    return [
-        DocumentRecord(
-            id=int(record["id"]),
-            filename=str(record["filename"]),
-            collection_name=str(record["collection_name"]),
-            chunk_count=int(record["chunk_count"]),
-            indexed_count=int(record["indexed_count"]),
-            created_at=str(record["created_at"]),
+    return [build_document_record(record) for record in records]
+
+
+@app.get("/documents/{document_id}", response_model=DocumentRecord)
+def get_document(document_id: int) -> DocumentRecord:
+    """查询单个文档记录。"""
+    record = get_existing_document_or_404(document_id)
+    return build_document_record(record)
+
+
+@app.delete("/documents/{document_id}", response_model=DeleteDocumentResponse)
+def delete_document(document_id: int) -> DeleteDocumentResponse:
+    """删除文档记录，并删除对应的 Chroma collection。"""
+    record = get_existing_document_or_404(document_id)
+    collection_name = str(record["collection_name"])
+
+    try:
+        deleted_from_chroma = delete_chroma_collection(collection_name)
+        deleted_from_mysql = delete_document_record(document_id)
+    except Exception as error:
+        raise_internal_error(error, f"DELETE /documents/{document_id}")
+
+    return DeleteDocumentResponse(
+        id=document_id,
+        filename=str(record["filename"]),
+        collection_name=collection_name,
+        deleted_from_chroma=deleted_from_chroma,
+        deleted_from_mysql=deleted_from_mysql,
+    )
+
+
+@app.post("/documents/{document_id}/questions", response_model=AskDocResponse)
+def ask_document_by_id(
+    document_id: int,
+    request: DocumentQuestionRequest,
+) -> AskDocResponse:
+    """根据 document_id 提问，后端自动查出 collection_name。"""
+    record = get_existing_document_or_404(document_id)
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="question 不能为空。",
         )
-        for record in records
+
+    if request.top_k <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="top_k 必须大于 0。",
+        )
+
+    if not 0 <= request.min_score <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="min_score 必须在 0 到 1 之间。",
+        )
+
+    try:
+        rag_result = answer_with_chroma_rag(
+            collection_name=str(record["collection_name"]),
+            query=question,
+            top_k=request.top_k,
+            min_score=request.min_score,
+        )
+    except Exception as error:
+        raise_internal_error(error, f"POST /documents/{document_id}/questions")
+
+    sources = [
+        SourceChunk(
+            index=int(source["index"]),
+            score=float(source["score"]),
+            text=str(source["text"]),
+        )
+        for source in rag_result["sources"]
     ]
+
+    return AskDocResponse(
+        answer=str(rag_result["answer"]),
+        sources=sources,
+    )
 
 
 @app.post("/ask-doc", response_model=AskDocResponse)
@@ -326,10 +449,7 @@ def ask_document(request: AskDocRequest) -> AskDocResponse:
             min_score=request.min_score,
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=explain_error(error),
-        ) from error
+        raise_internal_error(error, "POST /ask-doc")
 
     sources = [
         SourceChunk(

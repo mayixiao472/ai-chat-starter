@@ -663,6 +663,13 @@ def query_chroma_collection(
 
     safe_name = normalize_chroma_collection_name(collection_name)
     client = create_chroma_client()
+    existing_names = {
+        collection.name
+        for collection in client.list_collections()
+    }
+    if safe_name not in existing_names:
+        raise ValueError(f"没有找到 Chroma collection：{safe_name}")
+
     collection = client.get_collection(name=safe_name)
 
     query_embedding = create_real_embedding(query)
@@ -763,6 +770,22 @@ def list_chroma_collections() -> list[str]:
 
     client = create_chroma_client()
     return sorted(collection.name for collection in client.list_collections())
+
+
+def delete_chroma_collection(collection_name: str) -> bool:
+    """删除一个 Chroma collection，返回它原本是否存在。"""
+    safe_name = normalize_chroma_collection_name(collection_name)
+    client = create_chroma_client()
+    existing_names = {
+        collection.name
+        for collection in client.list_collections()
+    }
+
+    if safe_name not in existing_names:
+        return False
+
+    client.delete_collection(name=safe_name)
+    return True
 
 
 def get_last_user_message(messages: list[dict[str, str]]) -> str:

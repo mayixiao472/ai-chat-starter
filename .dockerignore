@@ -1,0 +1,11 @@
+.env
+.venv/
+.idea/
+__pycache__/
+*.pyc
+chroma_db/
+.git/
+.pytest_cache/
+.mypy_cache/
+*.log
+

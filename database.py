@@ -110,3 +110,49 @@ def list_document_records() -> list[dict[str, int | str | datetime]]:
             return list(cursor.fetchall())
     finally:
         connection.close()
+
+
+def get_document_record(document_id: int) -> dict[str, int | str | datetime] | None:
+    """根据 id 查询一条文档记录。"""
+    create_documents_table()
+
+    sql = """
+    SELECT
+      id,
+      filename,
+      collection_name,
+      chunk_count,
+      indexed_count,
+      created_at
+    FROM documents
+    WHERE id = %s;
+    """
+
+    connection = create_mysql_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (document_id,))
+            record = cursor.fetchone()
+            if record is None:
+                return None
+            return dict(record)
+    finally:
+        connection.close()
+
+
+def delete_document_record(document_id: int) -> bool:
+    """根据 id 删除一条文档记录，返回是否真的删除了记录。"""
+    create_documents_table()
+
+    sql = """
+    DELETE FROM documents
+    WHERE id = %s;
+    """
+
+    connection = create_mysql_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (document_id,))
+            return cursor.rowcount > 0
+    finally:
+        connection.close()
