@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel#定义数据格式（JSON长什么样）
 
+from agent.router import router as database_agent_router
 from database import (
     delete_document_record,
     get_document_record,
@@ -27,6 +28,8 @@ app = FastAPI(
     description="第二阶段学习用的 FastAPI 后端入口。",
     version="0.1.0",
 )
+
+app.include_router(database_agent_router)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
